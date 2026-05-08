@@ -32,6 +32,11 @@ let s:missing_popup_feature = !has('nvim') && !exists('*popup_create')
 let s:blamer_buffer_enabled = 0
 let s:blamer_show_enabled = 0
 
+" Async job state
+let s:blame_job = v:null
+let s:blame_output = []
+let s:blame_context = {}
+
 
 function! s:GetRelativeTime(commit_timestamp) abort
   let l:current_timestamp = localtime()
@@ -122,49 +127,28 @@ function! blamer#ParseCommitDataLine(line) abort
   return l:info
 endfunction
 
-function! blamer#GetMessages(file, line_number, line_count) abort
-  let l:dir_path = shellescape(s:substitute_path_separator(expand('%:h')))
-  let l:end_line = a:line_number + a:line_count - 1
-  let l:file_path_escaped = shellescape(a:file)
-  let l:command = 'LC_ALL=C git -C ' . l:dir_path . ' --no-pager blame --line-porcelain -L ' . a:line_number . ',' . l:end_line . ' -- ' . l:file_path_escaped
-  let l:result = system(l:command)
-  let l:lines = split(l:result, '\n')
+" Parse raw git blame --line-porcelain output lines into messages
+function! blamer#ParseBlameOutput(lines) abort
+  if len(a:lines) == 0
+    return []
+  endif
 
-  let hash = split(l:lines[0], ' ')[0]
-  let l:hash_is_empty = empty(matchstr(hash,'\c[0-9a-f]\{40}'))
+  let l:hash = split(a:lines[0], ' ')[0]
+  let l:hash_is_empty = empty(matchstr(l:hash,'\c[0-9a-f]\{40}'))
 
   if l:hash_is_empty
-    if l:result =~? 'fatal' && l:result =~? 'not a git repository'
-      " Not a git repository
-      let g:blamer_buffer_enabled = 0
-      echo '[blamer.nvim] Not a git repository'
-      return ''
-    endif
-
-    " Known git errors will be silenced
-    if l:result =~? 'no matches found'
-      return ''
-    elseif l:result =~? 'no such path'
-      return ''
-    elseif l:result =~? 'is outside repository'
-      return ''
-    elseif l:result =~? 'has only' && l:result =~? 'lines'
-      return ''
-    elseif l:result =~? 'no such ref'
-      return ''
-    endif
-
-    " Echo unknown errors in order to catch them
-    echo '[blamer.nvim] ' . l:result
-    return ''
+    return []
   endif
 
   let l:TAB_ASCII = 9
   let l:commit_data = {}
   let l:commit_data_per_line = []
 
-  for line in l:lines[0:]
+  for line in a:lines[0:]
     let l:line_words = split(line, ' ')
+    if len(l:line_words) == 0
+      continue
+    endif
     let l:is_line_hash = !empty(matchstr(l:line_words[0],'\c[0-9a-f]\{40}'))
     let l:has_line_tab = char2nr(l:line_words[0][0]) == l:TAB_ASCII
 
@@ -176,8 +160,8 @@ function! blamer#GetMessages(file, line_number, line_count) abort
             \ }
     elseif l:has_line_tab
       " line type TAB
-      " Change messsage when changes are not commited
-      if l:commit_data.author ==? 'Not Committed Yet'
+      " Change message when changes are not committed
+      if has_key(l:commit_data, 'author') && l:commit_data.author ==? 'Not Committed Yet'
         let l:commit_data.author = 'You'
         let l:commit_data.committer = 'You'
         let l:commit_data.summary = 'Uncommitted changes'
@@ -191,6 +175,44 @@ function! blamer#GetMessages(file, line_number, line_count) abort
   endfor
 
   return map(l:commit_data_per_line,'blamer#CommitDataToMessage(v:val)')
+endfunction
+
+" Legacy synchronous GetMessages (kept for backward compat, no longer used in main path)
+function! blamer#GetMessages(file, line_number, line_count) abort
+  let l:dir_path = shellescape(s:substitute_path_separator(expand('%:h')))
+  let l:end_line = a:line_number + a:line_count - 1
+  let l:file_path_escaped = shellescape(a:file)
+  let l:command = 'LC_ALL=C git -C ' . l:dir_path . ' --no-pager blame --line-porcelain -L ' . a:line_number . ',' . l:end_line . ' -- ' . l:file_path_escaped
+  let l:result = system(l:command)
+  let l:lines = split(l:result, '\n')
+
+  let l:hash = split(l:lines[0], ' ')[0]
+  let l:hash_is_empty = empty(matchstr(l:hash,'\c[0-9a-f]\{40}'))
+
+  if l:hash_is_empty
+    if l:result =~? 'fatal' && l:result =~? 'not a git repository'
+      let g:blamer_buffer_enabled = 0
+      echo '[blamer.nvim] Not a git repository'
+      return ''
+    endif
+
+    if l:result =~? 'no matches found'
+      return ''
+    elseif l:result =~? 'no such path'
+      return ''
+    elseif l:result =~? 'is outside repository'
+      return ''
+    elseif l:result =~? 'has only' && l:result =~? 'lines'
+      return ''
+    elseif l:result =~? 'no such ref'
+      return ''
+    endif
+
+    echo '[blamer.nvim] ' . l:result
+    return ''
+  endif
+
+  return blamer#ParseBlameOutput(l:lines)
 endfunction
 
 function! blamer#SetVirtualText(buffer_number, line_number, message) abort
@@ -229,6 +251,81 @@ function! blamer#CreatePopup(buffer_number, line_number, message) abort
   \})
 endfunction
 
+" Cancel any in-flight blame job
+function! s:KillBlameJob() abort
+  if s:blame_job isnot v:null
+    try
+      call job_stop(s:blame_job)
+    catch
+    endtry
+    let s:blame_job = v:null
+  endif
+  let s:blame_output = []
+endfunction
+
+" Callback: accumulate stdout lines from git blame job
+function! s:OnBlameOutput(channel, msg) abort
+  call add(s:blame_output, a:msg)
+endfunction
+
+" Callback: git blame job finished, parse output and render
+function! s:OnBlameClose(channel) abort
+  let l:lines = s:blame_output
+  let s:blame_output = []
+  let s:blame_job = v:null
+
+  " Validate context is still relevant
+  if empty(s:blame_context)
+    return
+  endif
+
+  let l:buffer_number = s:blame_context.buffer_number
+  let l:line_numbers = s:blame_context.line_numbers
+
+  " Check buffer still exists and is current
+  if !bufexists(l:buffer_number)
+    return
+  endif
+
+  " Check if blamer is still enabled
+  if g:blamer_enabled == 0 || s:blamer_buffer_enabled == 0 || s:blamer_show_enabled == 0
+    return
+  endif
+
+  " Check if we're still in the same buffer
+  if bufnr('') != l:buffer_number
+    return
+  endif
+
+  " Check if cursor is still on the same line(s)
+  let l:current_lines = s:GetLines()
+  if l:current_lines != l:line_numbers
+    return
+  endif
+
+  " Parse the output
+  let l:messages = blamer#ParseBlameOutput(l:lines)
+  if type(l:messages) != v:t_list || len(l:messages) == 0
+    return
+  endif
+
+  " Render
+  let l:index = 0
+  for line_number in l:line_numbers
+    if l:index >= len(l:messages)
+      break
+    endif
+    let l:message = l:messages[l:index]
+    if has('nvim')
+      call blamer#SetVirtualText(l:buffer_number, line_number, l:message)
+    else
+      call blamer#CreatePopup(l:buffer_number, line_number, l:message)
+    endif
+    let l:index += 1
+  endfor
+endfunction
+
+" Async version of Show - uses job_start instead of system()
 function! blamer#Show() abort
   if g:blamer_enabled == 0 || s:missing_popup_feature
     return
@@ -246,26 +343,35 @@ function! blamer#Show() abort
   endif
 
   let l:buffer_number = bufnr('')
-	let l:line_numbers = s:GetLines()
+  let l:line_numbers = s:GetLines()
 
-	let l:is_in_visual_mode = len(l:line_numbers) > 1
-	if l:is_in_visual_mode == 1 && s:blamer_show_in_visual_modes == 0
-	  return
-	endif
+  let l:is_in_visual_mode = len(l:line_numbers) > 1
+  if l:is_in_visual_mode == 1 && s:blamer_show_in_visual_modes == 0
+    return
+  endif
 
+  " Kill any previous in-flight job
+  call s:KillBlameJob()
+
+  " Build the git blame command
+  let l:dir_path = s:substitute_path_separator(expand('%:h'))
   let l:line_count = len(l:line_numbers)
-  let l:messages = blamer#GetMessages(l:file_path, l:line_numbers[0], l:line_count)
-  let l:index = 0
+  let l:end_line = l:line_numbers[0] + l:line_count - 1
+  let l:command = 'LC_ALL=C git -C ' . shellescape(l:dir_path) . ' --no-pager blame --line-porcelain -L ' . l:line_numbers[0] . ',' . l:end_line . ' -- ' . shellescape(l:file_path)
 
-	for line_number in l:line_numbers
-    let l:message = l:messages[l:index]
-    if has('nvim')
-      call blamer#SetVirtualText(l:buffer_number, line_number, l:message)
-    else
-      call blamer#CreatePopup(l:buffer_number, line_number, l:message)
-    endif
-    let l:index += 1
-  endfor
+  " Store context for the callback
+  let s:blame_context = {
+        \ 'buffer_number': l:buffer_number,
+        \ 'line_numbers': l:line_numbers,
+        \ }
+  let s:blame_output = []
+
+  " Start async job
+  let s:blame_job = job_start(['/bin/sh', '-c', l:command], {
+        \ 'out_cb': function('s:OnBlameOutput'),
+        \ 'close_cb': function('s:OnBlameClose'),
+        \ 'out_mode': 'nl',
+        \ })
 endfunction
 
 function! blamer#Hide() abort
@@ -325,6 +431,7 @@ function! blamer#BufferLeave() abort
     return
   endif
 
+  call s:KillBlameJob()
   call blamer#DisableShow()
 endfunction
 
@@ -332,6 +439,9 @@ function! blamer#Refresh() abort
   if g:blamer_enabled == 0 || s:blamer_buffer_enabled == 0 || s:blamer_show_enabled == 0
     return
   endif
+
+  " Kill any in-flight job
+  call s:KillBlameJob()
 
   call timer_stop(s:blamer_timer_id)
   call blamer#Hide()
@@ -345,6 +455,7 @@ endfunction
 
 function! blamer#Disable() abort
   let g:blamer_enabled = 0
+  call s:KillBlameJob()
 endfunction
 
 function! blamer#EnableShow() abort
@@ -362,6 +473,7 @@ function! blamer#DisableShow() abort
   endif
 
   let s:blamer_show_enabled = 0
+  call s:KillBlameJob()
   call timer_stop(s:blamer_timer_id)
   let s:blamer_timer_id = -1
   call blamer#Hide()
